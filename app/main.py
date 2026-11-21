@@ -21,6 +21,8 @@ def create_app(service: WeightingService | None = None) -> FastAPI:
             "配权采用两阶段线性规划：先最小化各组加权户数与目标的绝对差之和，"
             "再最小化各户权重相对初始权重的绝对改动之和，"
             "每户权重限制在初始权重的 0.5~2 倍。"
+            "对已完成且无法配平的作业，可按作业号进行冲突诊断，"
+            "找出目标差值超出名单可达上界最多的区县/人数档分组。"
         ),
         version="1.0.0",
     )
@@ -115,6 +117,13 @@ def create_app(service: WeightingService | None = None) -> FastAPI:
     @app.get("/weighting/differences", tags=["结果领取"])
     async def group_differences():
         return app.state.service.get_differences()
+
+    @app.get(
+        "/weighting/jobs/{job_id}/conflict-diagnosis",
+        tags=["冲突诊断"],
+    )
+    async def conflict_diagnosis(job_id: int):
+        return app.state.service.diagnose_conflict(job_id)
 
     return app
 

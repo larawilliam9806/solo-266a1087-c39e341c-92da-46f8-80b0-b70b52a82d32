@@ -23,15 +23,19 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-from . import database, weighting
+from . import database, diagnosis, weighting
 from .errors import (
+    JobNotFoundError,
     JobRunningError,
+    JobStatusConflictError,
     MissingTableError,
     MissingTargetsError,
     NoResultError,
     NotReadyError,
+    SnapshotMissingError,
     ValidationError,
 )
+from .weighting import LOWER_FACTOR, UPPER_FACTOR
 
 STATUS_LABELS = {
     "missing": "待配权（缺少数据表）",
@@ -657,3 +661,132 @@ class WeightingService:
                 "respondents": r_meta,
                 "targets": t_meta,
             }
+
+    # ------------------------------------------------------------------
+    # Conflict diagnosis on a finished, unbalanced job
+    #
+    # The job pins an exact (respondent_version, target_version) pair, so
+    # historical jobs and queries during a table handover are always
+    # recomputed against the snapshots the job originally ran with.
+    # ------------------------------------------------------------------
+    def _snapshot_exists(
+        self, conn: sqlite3.Connection, table: str, version: int
+    ) -> bool:
+        if table == "respondents":
+            row = conn.execute(
+                "SELECT 1 FROM respondent_versions WHERE version = ?",
+                (version,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM target_versions WHERE version = ?",
+                (version,),
+            ).fetchone()
+        return row is not None
+
+    def diagnose_conflict(self, job_id: int) -> dict:
+        with self._lock, database.db_session(self._db_path) as conn:
+            job = conn.execute(
+                "SELECT * FROM weighting_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+            if job is None:
+                raise JobNotFoundError(
+                    f"作业号 {job_id} 不存在",
+                    {"job_id": job_id},
+                )
+            r_ver = job["respondent_version"]
+            t_ver = job["target_version"]
+
+            missing_snapshots = []
+            if not self._snapshot_exists(conn, "respondents", r_ver):
+                missing_snapshots.append(
+                    {"table": "respondents", "version": r_ver}
+                )
+            if not self._snapshot_exists(conn, "targets", t_ver):
+                missing_snapshots.append(
+                    {"table": "targets", "version": t_ver}
+                )
+            if missing_snapshots:
+                raise SnapshotMissingError(
+                    f"作业 {job_id} 当时使用的源表版本已缺失，无法按原表诊断",
+                    {
+                        "job_id": job_id,
+                        "respondent_version": r_ver,
+                        "target_version": t_ver,
+                        "missing_snapshots": missing_snapshots,
+                    },
+                )
+
+            status = job["status"]
+            if status == "running":
+                raise JobStatusConflictError(
+                    f"作业 {job_id} 仍在配权计算中，尚未完成，无法诊断冲突",
+                    {
+                        "job_id": job_id,
+                        "actual_status": status,
+                        "required_status": "unbalanced",
+                    },
+                )
+            if status == "balanced":
+                raise JobStatusConflictError(
+                    f"作业 {job_id} 已配平，不存在无法配平的冲突可供诊断",
+                    {
+                        "job_id": job_id,
+                        "actual_status": status,
+                        "required_status": "unbalanced",
+                    },
+                )
+            if status == "failed":
+                raise JobStatusConflictError(
+                    f"作业 {job_id} 计算失败而非无法配平，无法诊断冲突: "
+                    f"{job['error_reason']}",
+                    {
+                        "job_id": job_id,
+                        "actual_status": status,
+                        "required_status": "unbalanced",
+                        "error_reason": job["error_reason"],
+                    },
+                )
+
+            # Immutable historical snapshots: the current version pointers
+            # are intentionally ignored here.
+            households = self._load_respondents(conn, r_ver)
+            target_rows = self._load_targets(conn, t_ver)
+
+        report = diagnosis.find_conflict(households, target_rows)
+        return {
+            "job_id": job_id,
+            "respondent_version": r_ver,
+            "target_version": t_ver,
+            "job_status": status,
+            "conflict_found": report.conflict_found,
+            "selected_groups": {
+                "districts": report.selected_districts,
+                "size_bands": report.selected_size_bands,
+            },
+            "target_sum_districts": report.target_sum_districts,
+            "target_sum_size_bands": report.target_sum_size_bands,
+            "target_difference": report.target_difference,
+            "reachable_upper_bound": report.reachable_upper_bound,
+            "excess": report.excess,
+            "upper_bound_breakdown": {
+                "both_sides_init_weight": report.both_sides_init_weight,
+                "district_only_init_weight": report.district_only_init_weight,
+                "band_only_init_weight": report.band_only_init_weight,
+                "neither_side_init_weight": report.neither_side_init_weight,
+                "district_only_factor": UPPER_FACTOR,
+                "band_only_factor": LOWER_FACTOR,
+            },
+            "candidate_group_counts": {
+                "district": report.district_group_count,
+                "size_band": report.size_band_group_count,
+            },
+            "combinations_scanned": report.combinations_scanned,
+            "message": (
+                "发现冲突证据：所选区县目标合计减人数档目标合计的差值，"
+                "超出名单在 0.5~2 倍权重约束下的可达上界"
+                if report.conflict_found
+                else "未找到冲突证据：所有区县/人数档选择均无正的超出量"
+            ),
+        }

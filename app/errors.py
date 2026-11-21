@@ -41,3 +41,18 @@ class NoResultError(WeightingError):
 class JobRunningError(WeightingError):
     status_code = 409
     code = "weighting_in_progress"
+
+
+class JobNotFoundError(WeightingError):
+    status_code = 404
+    code = "job_not_found"
+
+
+class JobStatusConflictError(WeightingError):
+    status_code = 409
+    code = "job_status_conflict"
+
+
+class SnapshotMissingError(WeightingError):
+    status_code = 409
+    code = "snapshot_missing"
